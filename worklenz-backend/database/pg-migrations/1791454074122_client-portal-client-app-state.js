@@ -31,6 +31,27 @@ exports.up = async (pgm) => {
     CREATE INDEX IF NOT EXISTS idx_client_portal_thread_client_reads_contact
         ON client_portal_thread_client_reads (contact_id);
 
+    -- The legacy portal used this name for organization-level reads. Preserve
+    -- that history before creating the v2 per-contact table with the same name.
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'client_portal_notification_reads'
+          AND column_name = 'client_id'
+      ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'client_portal_notification_reads'
+          AND column_name = 'contact_id'
+      ) THEN
+        ALTER TABLE client_portal_notification_reads
+          RENAME TO client_portal_notification_reads_legacy;
+      END IF;
+    END
+    $$;
+
     CREATE TABLE IF NOT EXISTS client_portal_notification_reads (
         notification_id UUID                     NOT NULL REFERENCES client_portal_notifications (id) ON DELETE CASCADE,
         contact_id      UUID                     NOT NULL REFERENCES client_contacts (id) ON DELETE CASCADE,
@@ -70,6 +91,8 @@ exports.down = async (pgm) => {
     DROP INDEX IF EXISTS idx_client_portal_notifications_project;
     DROP TABLE IF EXISTS client_contact_notification_prefs;
     DROP TABLE IF EXISTS client_portal_notification_reads;
+    ALTER TABLE IF EXISTS client_portal_notification_reads_legacy
+      RENAME TO client_portal_notification_reads;
     DROP TABLE IF EXISTS client_portal_thread_client_reads;
   `);
 };

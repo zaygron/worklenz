@@ -1,0 +1,123 @@
+name: worklenz-local
+x-backend: &backend
+  image: worklenz-local-backend:source
+  env_file: .env.local
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - "127.0.0.1:5548:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./worklenz-backend/database/sql:/docker-entrypoint-initdb.d/sql:ro
+      - ./worklenz-backend/database/00_init.sh:/worklenz-init/00_init.sh:ro
+      - ./local/db-init.sh:/docker-entrypoint-initdb.d/00_worklenz.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.41
+    command: ["mini", "-dir=/data"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+    ports:
+      - "127.0.0.1:8334:8333"
+    volumes:
+      - storage_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9333/cluster/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+  storage-init:
+    <<: *backend
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    entrypoint: ["node", "-e"]
+    command:
+      - |
+        const {S3Client,CreateBucketCommand,HeadBucketCommand}=require('@aws-sdk/client-s3');
+        const client=new S3Client({endpoint:process.env.S3_ENDPOINT,region:process.env.S3_REGION,forcePathStyle:true,credentials:{accessKeyId:process.env.S3_ACCESS_KEY_ID,secretAccessKey:process.env.S3_SECRET_ACCESS_KEY}});
+        const input={Bucket:process.env.S3_BUCKET};
+        client.send(new CreateBucketCommand(input)).catch(()=>client.send(new HeadBucketCommand(input))).then(()=>console.log('Local storage ready')).catch(error=>{console.error(error.message);process.exitCode=1;});
+    restart: "no"
+  migrate:
+    <<: *backend
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["npm", "run", "migrate:up"]
+    volumes:
+      - ./worklenz-backend/database/pg-migrations-support:/app/database/pg-migrations-support:ro
+      - ./worklenz-backend/database/pg-migrations:/app/database/pg-migrations:ro
+    restart: "no"
+  mailpit:
+    image: axllent/mailpit:latest
+    command: ["--smtp-auth-accept-any", "--smtp-auth-allow-insecure"]
+    ports:
+      - "127.0.0.1:8085:8025"
+    volumes:
+      - mail_data:/data
+    environment:
+      MP_DATABASE: /data/mailpit.db
+    restart: unless-stopped
+  backend:
+    <<: *backend
+    build:
+      context: ./worklenz-backend
+      args:
+        RELEASE_VERSION: local-source
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      storage-init:
+        condition: service_completed_successfully
+      mailpit:
+        condition: service_started
+    restart: unless-stopped
+  frontend:
+    image: worklenz-local-frontend:source
+    build:
+      context: ./worklenz-frontend
+    env_file: .env.local
+    volumes:
+      - ./local/frontend-env.sh:/local/frontend-env.sh:ro
+    command: ["/bin/sh", "-c", "sh /local/frontend-env.sh && exec serve -s build -l 5000"]
+    depends_on:
+      - backend
+    restart: unless-stopped
+  client-portal:
+    image: worklenz-local-client-portal:source
+    build:
+      context: ./worklenz-client-portal
+      args:
+        VITE_API_BASE_URL: http://localhost:8083/api/client-portal
+    depends_on:
+      - backend
+    restart: unless-stopped
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "127.0.0.1:8082:80"
+      - "127.0.0.1:8083:81"
+    volumes:
+      - ./local/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - frontend
+      - client-portal
+      - backend
+    restart: unless-stopped
+volumes:
+  postgres_data:
+  storage_data:
+  mail_data:
